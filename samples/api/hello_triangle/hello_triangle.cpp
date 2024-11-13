@@ -17,7 +17,10 @@
 
 #include "hello_triangle.h"
 
+#include <iostream>
 #include "common/vk_common.h"
+#include "common/vk_initializers.h"
+#include "core/buffer.h"
 #include "core/util/logging.hpp"
 #include "filesystem/legacy.h"
 #include "glsl_compiler.h"
@@ -533,7 +536,7 @@ void HelloTriangle::init_swapchain(Context &context)
 	info.imageExtent.width  = swapchain_size.width;
 	info.imageExtent.height = swapchain_size.height;
 	info.imageArrayLayers   = 1;
-	info.imageUsage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	info.imageUsage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	info.imageSharingMode   = VK_SHARING_MODE_EXCLUSIVE;
 	info.preTransform       = pre_transform;
 	info.compositeAlpha     = composite;
@@ -569,8 +572,9 @@ void HelloTriangle::init_swapchain(Context &context)
 	VK_CHECK(vkGetSwapchainImagesKHR(context.device, context.swapchain, &image_count, nullptr));
 
 	/// The swapchain images.
-	std::vector<VkImage> swapchain_images(image_count);
-	VK_CHECK(vkGetSwapchainImagesKHR(context.device, context.swapchain, &image_count, swapchain_images.data()));
+	context.swapchain_images.clear();
+	context.swapchain_images.resize(image_count);
+	VK_CHECK(vkGetSwapchainImagesKHR(context.device, context.swapchain, &image_count, context.swapchain_images.data()));
 
 	// Initialize per-frame resources.
 	// Every swapchain image has its own command pool and fence manager.
@@ -589,7 +593,7 @@ void HelloTriangle::init_swapchain(Context &context)
 		VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
 		view_info.viewType                    = VK_IMAGE_VIEW_TYPE_2D;
 		view_info.format                      = context.swapchain_dimensions.format;
-		view_info.image                       = swapchain_images[i];
+		view_info.image                       = context.swapchain_images[i];
 		view_info.subresourceRange.levelCount = 1;
 		view_info.subresourceRange.layerCount = 1;
 		view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -627,7 +631,7 @@ void HelloTriangle::init_render_pass(Context &context)
 	// The image layout will be undefined when the render pass begins.
 	attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	// After the render pass is complete, we will transition to PRESENT_SRC_KHR layout.
-	attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	attachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
 	// We have one subpass. This subpass has one color attachment.
 	// While executing this subpass, the attachment will be in attachment optimal layout.
@@ -855,6 +859,86 @@ VkResult HelloTriangle::acquire_next_image(Context &context, uint32_t *image)
 	return VK_SUCCESS;
 }
 
+uint32_t HelloTriangle::get_memory_type_index(Context &context, uint32_t type_bits, VkMemoryPropertyFlags properties)
+{
+	VkPhysicalDeviceMemoryProperties deviceMemoryProperties;
+	vkGetPhysicalDeviceMemoryProperties(context.gpu, &deviceMemoryProperties);
+	for (uint32_t i = 0; i < deviceMemoryProperties.memoryTypeCount; i++) {
+		if ((type_bits & 1) == 1) {
+			if ((deviceMemoryProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+				return i;
+			}
+		}
+		type_bits >>= 1;
+	}
+	
+	throw std::runtime_error("Failed to find suitable memory type.");
+}
+
+std::pair<VkImage, VkDeviceMemory> HelloTriangle::create_image(Context &context, VkFormat format, 
+    VkImageUsageFlags usage, VkMemoryPropertyFlags memory_properties)
+{
+	VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+	image_info.imageType     = VK_IMAGE_TYPE_2D;
+	image_info.format        = format;
+	image_info.extent.width  = context.swapchain_dimensions.width;
+	image_info.extent.height = context.swapchain_dimensions.height;
+	image_info.extent.depth  = 1;
+	image_info.mipLevels     = 1;
+	image_info.arrayLayers   = 1;
+	image_info.samples       = VK_SAMPLE_COUNT_1_BIT;
+	image_info.tiling        = VK_IMAGE_TILING_LINEAR;
+	image_info.usage         = usage;
+	image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	VkImage image;
+	VK_CHECK(vkCreateImage(context.device, &image_info, nullptr, &image));
+
+	VkMemoryRequirements memory_requirements;
+	vkGetImageMemoryRequirements(context.device, image, &memory_requirements);
+
+	VkMemoryAllocateInfo alloc_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+	alloc_info.allocationSize  = memory_requirements.size;
+	alloc_info.memoryTypeIndex = get_memory_type_index(context, memory_requirements.memoryTypeBits, memory_properties);
+
+	VkDeviceMemory memory;
+	VK_CHECK(vkAllocateMemory(context.device, &alloc_info, nullptr, &memory));
+
+	VK_CHECK(vkBindImageMemory(context.device, image, memory, 0));
+
+	return {image, memory};
+}
+
+VkCommandBuffer HelloTriangle::create_command_buffer(PerFrame &per_frame)
+{
+	VkCommandBuffer cmd;
+	VkCommandBufferAllocateInfo info = vkb::initializers::command_buffer_allocate_info(
+		per_frame.primary_command_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1);
+
+	VK_CHECK(vkAllocateCommandBuffers(per_frame.device, &info, &cmd));
+
+	return cmd;
+}
+
+/**
+ * @brief Submits work to the GPU.
+ * @param context A Vulkan context with a device and a queue already set up.
+ * @param cmdBuffer The command buffer to submit.
+ * @param queue The queue to submit the work to.
+ */
+void HelloTriangle::submit_work(Context &context, VkCommandBuffer cmdBuffer)
+{
+	VkSubmitInfo submit_info = vkb::initializers::submit_info();
+	submit_info.commandBufferCount = 1;
+	submit_info.pCommandBuffers = &cmdBuffer;
+	VkFenceCreateInfo fence_info = vkb::initializers::fence_create_info();
+	VkFence fence;
+	VK_CHECK(vkCreateFence(context.device, &fence_info, nullptr, &fence));
+	VK_CHECK(vkQueueSubmit(context.queue, 1, &submit_info, fence));
+	VK_CHECK(vkWaitForFences(context.device, 1, &fence, VK_TRUE, UINT64_MAX));
+	vkDestroyFence(context.device, fence, nullptr);
+}
+
 /**
  * @brief Renders a triangle to the specified swapchain image.
  * @param context A Vulkan context set up for rendering.
@@ -935,6 +1019,96 @@ void HelloTriangle::render_triangle(Context &context, uint32_t swapchain_index)
 	info.pSignalSemaphores    = &context.per_frame[swapchain_index].swapchain_release_semaphore;
 	// Submit command buffer to graphics queue
 	VK_CHECK(vkQueueSubmit(context.queue, 1, &info, context.per_frame[swapchain_index].queue_submit_fence));
+}
+
+void HelloTriangle::save_ppm(int width, int height, int row_pitch, char* image_data, std::string filename)
+{
+	std::ofstream file(filename, std::ios::out | std::ios::binary);
+
+	// ppm header
+	file << "P6\n" << width << "\n" << height << "\n" << 255 << "\n";
+
+	// ppm binary pixel data
+	for (int y = 0; y < height; y++) {
+		unsigned int *row = (unsigned int*)image_data;
+		for (int x = 0; x < width; x++) {
+			file.write((char*)row, 3);
+			row++;
+		}
+		image_data += row_pitch;
+	}
+
+	file.close();
+
+	LOGI("Image saved to: {}\n", filename);
+}
+
+/**
+ * @brief Saves the image to a file.
+ * @param context A Vulkan context with a swapchain already set up.
+ * @param swapchain_index The swapchain index for the image being saved.
+ */
+void HelloTriangle::save_image(Context &context, uint32_t swapchain_index, std::string filename)
+{
+	// Wait for rendering commands to finish.
+	vkWaitForFences(context.device, 1, &context.per_frame[swapchain_index].queue_submit_fence, VK_TRUE, UINT64_MAX);
+
+	// Create a CPU-visible destination image to copy into.
+	auto [dst_image, dst_memory] = create_image(context, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	VkImage& src_image 			 = context.swapchain_images[swapchain_index];	
+
+	// Do the actual blit from color attachment to our destination image.
+	VkCommandBuffer cmd = create_command_buffer(context.per_frame[swapchain_index]);
+	VkCommandBufferBeginInfo begin_info = vkb::initializers::command_buffer_begin_info();
+	VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
+
+	vkb::image_layout_transition(cmd, dst_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+	VkImageCopy copy_region{};
+	copy_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copy_region.srcSubresource.layerCount = 1;
+	copy_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copy_region.dstSubresource.layerCount = 1;
+	copy_region.extent.width              = context.swapchain_dimensions.width;
+	copy_region.extent.height             = context.swapchain_dimensions.height;
+	copy_region.extent.depth              = 1;
+
+	vkCmdCopyImage(cmd, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+
+	// Transition destination image to general layout, which is the required layout for mapping the image memory later on
+	VkImageSubresourceRange subresource_range { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	vkb::image_layout_transition(cmd, dst_image, 
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, 
+		subresource_range);
+
+	// Convert swapchain image to VK_IMAGE_LAYOUT_PRESENT_SRC_KHR for later presenting
+	vkb::image_layout_transition(cmd, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+	VK_CHECK(vkEndCommandBuffer(cmd));
+
+	submit_work(context, cmd);
+
+	// Get layout of the image (including row pitch)
+	VkImageSubresource subResource{};
+	subResource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	VkSubresourceLayout subResourceLayout;
+
+	vkGetImageSubresourceLayout(context.device, dst_image, &subResource, &subResourceLayout);
+
+	// Map image memory so we can start copying from it
+	char* image_data;
+	vkMapMemory(context.device, dst_memory, 0, VK_WHOLE_SIZE, 0, (void**)&image_data);
+
+	// Write the image to a file
+	save_ppm(context.swapchain_dimensions.width, context.swapchain_dimensions.height, subResourceLayout.rowPitch, image_data, filename);
+
+	vkUnmapMemory(context.device, dst_memory);
+
+	vkDestroyImage(context.device, dst_image, nullptr);
+	vkFreeMemory(context.device, dst_memory, nullptr);
 }
 
 /**
@@ -1082,11 +1256,20 @@ bool HelloTriangle::prepare(const vkb::ApplicationOptions &options)
 {
 	assert(options.window != nullptr);
 
-	init_instance(context, {VK_KHR_SURFACE_EXTENSION_NAME}, {});
+	init_instance(context, {VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME}, {"VK_LAYER_KHRONOS_validation"});
 
 	vk_instance = std::make_unique<vkb::Instance>(context.instance);
 
-	context.surface                     = options.window->create_surface(*vk_instance);
+	// Create headless surface
+	{
+		VkHeadlessSurfaceCreateInfoEXT headlessCreateInfo = {};
+		headlessCreateInfo.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT;
+		VkResult result = vkCreateHeadlessSurfaceEXT(context.instance, &headlessCreateInfo, NULL, &context.surface);
+
+		if (result != VK_SUCCESS)
+			LOGE("Failed to create headless surface.");
+	}
+	//context.surface                     = options.window->create_surface(*vk_instance);
 	auto &extent                        = options.window->get_extent();
 	context.swapchain_dimensions.width  = extent.width;
 	context.swapchain_dimensions.height = extent.height;
@@ -1110,7 +1293,7 @@ bool HelloTriangle::prepare(const vkb::ApplicationOptions &options)
 
 void HelloTriangle::update(float delta_time)
 {
-	uint32_t index;
+	uint32_t index = 0;
 
 	auto res = acquire_next_image(context, &index);
 
@@ -1128,6 +1311,7 @@ void HelloTriangle::update(float delta_time)
 	}
 
 	render_triangle(context, index);
+	save_image(context, index, "hello_triangle.ppm");
 	res = present_image(context, index);
 
 	// Handle Outdated error in present.

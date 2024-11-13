@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <utility>
 #include "common/vk_common.h"
 #include "core/instance.h"
 #include "platform/application.h"
@@ -94,6 +95,9 @@ class HelloTriangle : public vkb::Application
 		/// The image view for each swapchain image.
 		std::vector<VkImageView> swapchain_image_views;
 
+		/// The image for each swapchain image.
+		std::vector<VkImage> swapchain_images;
+
 		/// The framebuffer for each swapchain image view.
 		std::vector<VkFramebuffer> swapchain_framebuffers;
 
@@ -159,7 +163,19 @@ class HelloTriangle : public vkb::Application
 
 	VkResult acquire_next_image(Context &context, uint32_t *image);
 
+	uint32_t get_memory_type_index(Context &context, uint32_t type_bits, VkMemoryPropertyFlags properties);
+
+	VkCommandBuffer create_command_buffer(PerFrame &per_frame);
+
+	std::pair<VkImage, VkDeviceMemory> create_image(Context &context, VkFormat format, VkImageUsageFlags usage, VkMemoryPropertyFlags properties);
+
+	void submit_work(Context &context, VkCommandBuffer cmdBuffer);
+
 	void render_triangle(Context &context, uint32_t swapchain_index);
+
+	void save_ppm(int width, int height, int row_pitch, char* image_data, std::string filename);
+
+	void save_image(Context &context, uint32_t swapchain_index, std::string filename);
 
 	VkResult present_image(Context &context, uint32_t index);
 
